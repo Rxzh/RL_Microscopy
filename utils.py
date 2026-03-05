@@ -42,6 +42,17 @@ def compute_true_gradients(latent_map: np.ndarray) -> np.ndarray:
     return np.linalg.norm(grad_mag, axis=-1)  # (H, W)
 
 
+def load_multiple_datasets(tif_dirs: list) -> list:
+    """Load and precompute gradients for each dataset directory.
+    Returns list of (latent_map (H,W,N), true_grad_map (H,W)) tuples."""
+    datasets = []
+    for d in tif_dirs:
+        lm = load_latent_map(d)
+        gm = compute_true_gradients(lm)
+        datasets.append((lm, gm))
+    return datasets
+
+
 def interpolate_latents(
     sampled_coords: np.ndarray,
     sampled_values: np.ndarray,

@@ -14,24 +14,25 @@ from utils import (
 class EBSDEnv(gym.Env):
     """Adaptive EBSD scanning environment.
 
-    The agent selects beam positions one at a time, maximizing information
-    gain (reduction in gradient prediction error) within a fixed step budget.
+    The agent selects beam positions one at a time on a random tile of the
+    full latent map, maximizing information gain within a fixed step budget.
 
-    Observation channels (H, W, N+3):
+    Observation channels (N+3, tile_h, tile_w):
         [0]        — binary mask (1=sampled, 0=not)
         [1:N+1]    — interpolated N-D latent map (nearest-neighbor)
         [N+1]      — predicted gradient magnitude map
         [N+2]      — uncertainty map (normalized distance to nearest sample)
 
-    Action space: Discrete(H * W) — flat grid index.
+    Action space: Discrete(tile_h * tile_w) — flat grid index within tile.
     """
 
     metadata = {"render_modes": []}
 
     def __init__(
         self,
-        latent_map: np.ndarray,
-        true_grad_map: np.ndarray,
+        dataset_list: list,  # [(latent_map (H,W,N), true_grad_map (H,W)), ...]
+        tile_h: int = 128,
+        tile_w: int = 128,
         max_steps: int = None,
         step_penalty: float = 0.01,
         lambda_scale: float = 1.0,
@@ -39,19 +40,25 @@ class EBSDEnv(gym.Env):
     ):
         """
         Args:
-            latent_map: (H, W, N) ground-truth latent map.
-            true_grad_map: (H, W) ground-truth gradient magnitude.
-            max_steps: budget (defaults to 20% of H*W).
+            dataset_list: list of (latent_map, true_grad_map) tuples.
+            tile_h: height of the random tile sampled each episode.
+            tile_w: width of the random tile sampled each episode.
+            max_steps: budget (defaults to 20% of tile_h*tile_w).
             step_penalty: β subtracted from reward each step.
             lambda_scale: λ multiplier on information-gain term.
             seed_grid_size: number of points per side in the initial seed grid.
         """
         super().__init__()
-        self.latent_map = latent_map.astype(np.float32)
-        self.true_grad_map = true_grad_map.astype(np.float32)
+        self._dataset_list = dataset_list
+        self.tile_h = tile_h
+        self.tile_w = tile_w
 
-        self.H, self.W, self.N = latent_map.shape
+        # Fixed tile dimensions used throughout training
+        self.H = tile_h
+        self.W = tile_w
+        self.N = dataset_list[0][0].shape[2]
         self.n_pixels = self.H * self.W
+
         self.max_steps = max_steps if max_steps is not None else max(1, int(0.2 * self.n_pixels))
         self.beta = step_penalty
         self.lam = lambda_scale
@@ -66,7 +73,11 @@ class EBSDEnv(gym.Env):
         )
         self.action_space = spaces.Discrete(self.n_pixels)
 
-        # State buffers (initialised in reset)
+        # Episode state (initialised in reset)
+        self.latent_map: np.ndarray = None
+        self.true_grad_map: np.ndarray = None
+        self.tile_origin: tuple = (0, 0)
+        self._dataset_idx: int = 0
         self._mask: np.ndarray = None
         self._sampled_coords: list = None
         self._sampled_values: list = None
@@ -74,6 +85,7 @@ class EBSDEnv(gym.Env):
         self._grad_map: np.ndarray = None
         self._uncertainty_map: np.ndarray = None
         self.step_count: int = 0
+        self._last_episode_snapshot: dict = None
 
     # ------------------------------------------------------------------
     # Gymnasium API
@@ -81,6 +93,19 @@ class EBSDEnv(gym.Env):
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
+
+        # Pick a random dataset
+        self._dataset_idx = int(self.np_random.integers(0, len(self._dataset_list)))
+        full_latent, full_grad = self._dataset_list[self._dataset_idx]
+        H_full, W_full = full_latent.shape[:2]
+
+        # Sample random tile origin
+        r0 = int(self.np_random.integers(0, max(1, H_full - self.tile_h + 1)))
+        c0 = int(self.np_random.integers(0, max(1, W_full - self.tile_w + 1)))
+        self.tile_origin = (r0, c0)
+
+        self.latent_map = full_latent[r0:r0 + self.tile_h, c0:c0 + self.tile_w].astype(np.float32)
+        self.true_grad_map = full_grad[r0:r0 + self.tile_h, c0:c0 + self.tile_w].astype(np.float32)
 
         self._mask = np.zeros((self.H, self.W), dtype=np.float32)
         self._sampled_coords = []
@@ -95,7 +120,8 @@ class EBSDEnv(gym.Env):
                 self._add_sample(r, c)
 
         self._rebuild_state()
-        return self._get_obs(), {}
+        info = {"tile_origin": self.tile_origin, "dataset_idx": self._dataset_idx}
+        return self._get_obs(), info
 
     def step(self, action: int):
         row, col = divmod(int(action), self.W)
@@ -114,12 +140,23 @@ class EBSDEnv(gym.Env):
         truncated = self.step_count >= self.max_steps
         terminated = False
 
+        if truncated:
+            self._last_episode_snapshot = {
+                "interp_latent_ch0": self._interp_latents[:, :, 0].copy(),
+                "mask": self._mask.copy(),
+                "tile_origin": self.tile_origin,
+                "dataset_idx": self._dataset_idx,
+                "step_count": self.step_count,
+            }
+
         info = {
             "true_grad": true_grad,
             "predicted_grad": predicted_grad,
             "step_count": self.step_count,
             "row": row,
             "col": col,
+            "tile_origin": self.tile_origin,
+            "dataset_idx": self._dataset_idx,
         }
         return self._get_obs(), reward, terminated, truncated, info
 
@@ -147,10 +184,10 @@ class EBSDEnv(gym.Env):
         # Build (H, W, N+3) then transpose to (N+3, H, W) for SB3
         obs_hw = np.concatenate(
             [
-                self._mask[:, :, np.newaxis],           # (H, W, 1)
-                self._interp_latents,                   # (H, W, N)
-                self._grad_map[:, :, np.newaxis],        # (H, W, 1)
-                self._uncertainty_map[:, :, np.newaxis], # (H, W, 1)
+                self._mask[:, :, np.newaxis],            # (H, W, 1)
+                self._interp_latents,                    # (H, W, N)
+                self._grad_map[:, :, np.newaxis],         # (H, W, 1)
+                self._uncertainty_map[:, :, np.newaxis],  # (H, W, 1)
             ],
             axis=-1,
         )  # (H, W, N+3)

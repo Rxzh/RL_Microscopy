@@ -1,2 +1,5 @@
 /TIF
 .DS_Store
+/__pycache__
+/checkpoints
+/logs

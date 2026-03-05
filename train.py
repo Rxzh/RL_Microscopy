@@ -4,34 +4,121 @@ import argparse
 import os
 
 import numpy as np
-import gymnasium as gym
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
-from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
+from stable_baselines3.common.callbacks import (
+    BaseCallback,
+    CheckpointCallback,
+    EvalCallback,
+)
 
-from utils import load_latent_map, compute_true_gradients
+from utils import load_multiple_datasets, compute_true_gradients
 from ebsd_env import EBSDEnv
 from model import EBSDPolicy
 
 
-def make_env(latent_map: np.ndarray, true_grad_map: np.ndarray, seed: int = 0):
+def make_env(dataset_list, tile_h, tile_w, seed=0):
     def _init():
-        env = EBSDEnv(latent_map, true_grad_map)
+        env = EBSDEnv(dataset_list, tile_h=tile_h, tile_w=tile_w)
         env.reset(seed=seed)
         return env
     return _init
 
 
-def build_venv(latent_map: np.ndarray, true_grad_map: np.ndarray, seed: int = 0):
-    venv = DummyVecEnv([make_env(latent_map, true_grad_map, seed)])
+def build_venv(dataset_list, tile_h, tile_w, seed=0):
+    venv = DummyVecEnv([make_env(dataset_list, tile_h, tile_w, seed)])
     venv = VecNormalize(venv, norm_obs=True, norm_reward=True, clip_obs=10.0)
     return venv
 
 
+class EpisodeLogCallback(BaseCallback):
+    def __init__(self, figure_every=50, figure_dir="figures", verbose=1):
+        super().__init__(verbose)
+        self.figure_every = figure_every
+        self.figure_dir = figure_dir
+        self._episode_count = 0
+        self._current_ep_reward = 0.0
+
+    def _on_step(self) -> bool:
+        rewards = self.locals["rewards"]   # shape (n_envs,)
+        dones   = self.locals["dones"]     # shape (n_envs,)
+        infos   = self.locals["infos"]
+
+        for i in range(len(dones)):
+            self._current_ep_reward += float(rewards[i])
+            if dones[i]:
+                info = infos[i]
+                ep_len    = info.get("step_count", -1)
+                tile_orig = info.get("tile_origin", (-1, -1))
+                ds_idx    = info.get("dataset_idx", 0)
+                ep_reward = self._current_ep_reward
+
+                print(
+                    f"[Episode {self._episode_count + 1:>5d}] "
+                    f"reward={ep_reward:+.3f}  steps={ep_len}  "
+                    f"tile=({tile_orig[0]},{tile_orig[1]})  dataset={ds_idx}"
+                )
+
+                self.logger.record("episode/reward", ep_reward)
+                self.logger.record("episode/length", ep_len)
+                self.logger.record("episode/tile_row", tile_orig[0])
+                self.logger.record("episode/tile_col", tile_orig[1])
+                self.logger.dump(self.num_timesteps)
+
+                self._episode_count += 1
+                self._current_ep_reward = 0.0
+
+                if (self.figure_every > 0
+                        and self._episode_count % self.figure_every == 0):
+                    self._save_figure(i)
+        return True
+
+    def _save_figure(self, env_idx: int):
+        import matplotlib.pyplot as plt
+
+        try:
+            inner_env = self.training_env.venv.envs[env_idx]
+        except AttributeError:
+            inner_env = self.training_env.envs[env_idx]
+        snap = getattr(inner_env, "_last_episode_snapshot", None)
+        if snap is None:
+            return
+
+        os.makedirs(self.figure_dir, exist_ok=True)
+        fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+
+        axes[0].imshow(snap["interp_latent_ch0"], cmap="viridis", origin="upper")
+        axes[0].set_title("Final interp latent (ch 0)")
+        axes[0].axis("off")
+
+        axes[1].imshow(snap["interp_latent_ch0"], cmap="viridis", origin="upper", alpha=0.7)
+        ys, xs = np.where(snap["mask"] > 0)
+        axes[1].scatter(xs, ys, s=2, c="red", label="sampled")
+        axes[1].set_title(
+            f"Sampling mask  tile=({snap['tile_origin'][0]},{snap['tile_origin'][1]})"
+            f"  steps={snap['step_count']}"
+        )
+        axes[1].axis("off")
+
+        fig.tight_layout()
+        fname = os.path.join(
+            self.figure_dir,
+            f"ep{self._episode_count:06d}_tile{snap['tile_origin'][0]}x{snap['tile_origin'][1]}.png",
+        )
+        fig.savefig(fname, dpi=100)
+        plt.close(fig)
+        if self.verbose:
+            print(f"  [Figure saved → {fname}]")
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Train EBSD RL agent")
-    parser.add_argument("--tif_dir", type=str, default="TIF",
-                        help="Directory containing latent TIF files")
+    parser.add_argument("--tif_dirs", nargs="+", default=["TIF"],
+                        help="One or more directories containing latent TIF files")
+    parser.add_argument("--tile_h", type=int, default=128,
+                        help="Tile height for each episode")
+    parser.add_argument("--tile_w", type=int, default=128,
+                        help="Tile width for each episode")
     parser.add_argument("--total_timesteps", type=int, default=1_000_000)
     parser.add_argument("--n_steps", type=int, default=512,
                         help="PPO rollout steps per update")
@@ -45,11 +132,13 @@ def parse_args():
                         help="Run deterministic eval every N env steps (0=disabled)")
     parser.add_argument("--synthetic", action="store_true",
                         help="Use a synthetic 50x50 random latent map (for testing)")
-    parser.add_argument(
-        "--device", type=str, default="auto",
-        choices=["auto", "cpu", "cuda", "mps"],
-        help="PyTorch device for policy/rollout buffer (auto=SB3 picks best available)",
-    )
+    parser.add_argument("--device", type=str, default="auto",
+                        choices=["auto", "cpu", "cuda", "mps"],
+                        help="PyTorch device")
+    parser.add_argument("--figure_every", type=int, default=50,
+                        help="Save a figure every N episodes (0=disabled)")
+    parser.add_argument("--figure_dir", type=str, default="figures",
+                        help="Directory for episode figures")
     return parser.parse_args()
 
 
@@ -62,29 +151,29 @@ def main():
     if args.synthetic:
         print("Using synthetic 50x50 random latent map for testing.")
         rng = np.random.default_rng(args.seed)
-        latent_map = rng.standard_normal((50, 50, 23)).astype(np.float32)
-        true_grad_map = compute_true_gradients(latent_map)
+        lm = rng.standard_normal((50, 50, 23)).astype(np.float32)
+        gm = compute_true_gradients(lm)
+        dataset_list = [(lm, gm)]
     else:
-        print(f"Loading latent maps from {args.tif_dir} ...")
-        latent_map = load_latent_map(args.tif_dir)
-        print(f"  Latent map shape: {latent_map.shape}")
-        print("Computing true gradient map ...")
-        true_grad_map = compute_true_gradients(latent_map)
+        print(f"Loading latent maps from {args.tif_dirs} ...")
+        dataset_list = load_multiple_datasets(args.tif_dirs)
+        for i, (lm, _) in enumerate(dataset_list):
+            print(f"  Dataset {i}: shape={lm.shape}")
 
     # ------------------------------------------------------------------ #
     # 2. Build vectorised environment
     # ------------------------------------------------------------------ #
-    venv = build_venv(latent_map, true_grad_map, seed=args.seed)
+    venv = build_venv(dataset_list, args.tile_h, args.tile_w, seed=args.seed)
 
     # ------------------------------------------------------------------ #
-    # 3. Build evaluation env (separate, non-normalised stats)
+    # 3. Callbacks
     # ------------------------------------------------------------------ #
-    callbacks = []
-
     log_dir = os.path.join("logs", args.run_name)
     ckpt_dir = os.path.join("checkpoints", args.run_name)
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(ckpt_dir, exist_ok=True)
+
+    callbacks = []
 
     ckpt_cb = CheckpointCallback(
         save_freq=max(args.checkpoint_freq // 1, 1),
@@ -95,7 +184,7 @@ def main():
     callbacks.append(ckpt_cb)
 
     if args.eval_freq > 0:
-        eval_venv = build_venv(latent_map, true_grad_map, seed=args.seed + 1)
+        eval_venv = build_venv(dataset_list, args.tile_h, args.tile_w, seed=args.seed + 1)
         eval_cb = EvalCallback(
             eval_venv,
             best_model_save_path=os.path.join(ckpt_dir, "best"),
@@ -105,6 +194,14 @@ def main():
             deterministic=True,
         )
         callbacks.append(eval_cb)
+
+    callbacks.append(
+        EpisodeLogCallback(
+            figure_every=args.figure_every,
+            figure_dir=args.figure_dir,
+            verbose=1,
+        )
+    )
 
     # ------------------------------------------------------------------ #
     # 4. Configure and create PPO model
