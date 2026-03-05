@@ -15,6 +15,7 @@ from stable_baselines3.common.callbacks import (
 from utils import load_multiple_datasets, compute_true_gradients
 from ebsd_env import EBSDEnv
 from model import EBSDPolicy
+import torch
 
 
 def make_env(dataset_list, tile_h, tile_w, seed=0):
@@ -149,9 +150,11 @@ def main():
     # 1. Load data
     # ------------------------------------------------------------------ #
     if args.synthetic:
-        print("Using synthetic 50x50 random latent map for testing.")
+        synth_h = max(args.tile_h, 50)
+        synth_w = max(args.tile_w, 50)
+        print(f"Using synthetic {synth_h}x{synth_w} random latent map for testing.")
         rng = np.random.default_rng(args.seed)
-        lm = rng.standard_normal((50, 50, 23)).astype(np.float32)
+        lm = rng.standard_normal((synth_h, synth_w, 23)).astype(np.float32)
         gm = compute_true_gradients(lm)
         dataset_list = [(lm, gm)]
     else:
@@ -221,7 +224,7 @@ def main():
         tensorboard_log=log_dir,
         verbose=1,
         seed=args.seed,
-        device=args.device,
+        device=torch.device(args.device),
     )
     print(f"Training on device: {model.device}")
 
