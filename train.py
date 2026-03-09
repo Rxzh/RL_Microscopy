@@ -15,7 +15,25 @@ from stable_baselines3.common.callbacks import (
 from utils import load_multiple_datasets, compute_true_gradients
 from ebsd_env import EBSDEnv
 from model import EBSDPolicy
-import torch
+
+
+class MaskPreservingVecNormalize(VecNormalize):
+    """VecNormalize that skips normalizing channel 0 (binary mask).
+
+    Channel 0 of the observation is the binary sampling mask (0/1) used
+    for action masking in the policy.  Standard VecNormalize would shift
+    zeros away from 0.0, breaking the `.bool()` test in _masked_logits.
+    """
+
+    def normalize_obs(self, obs):
+        normalized = super().normalize_obs(obs)
+        # obs layout: (..., C, H, W) — restore raw channel 0
+        # Handle both batched (B, C, H, W) and single (C, H, W) observations
+        if normalized.ndim == 4:
+            normalized[:, 0, :, :] = obs[:, 0, :, :]
+        elif normalized.ndim == 3:
+            normalized[0, :, :] = obs[0, :, :]
+        return normalized
 
 
 def make_env(dataset_list, tile_h, tile_w, seed=0):
@@ -28,7 +46,9 @@ def make_env(dataset_list, tile_h, tile_w, seed=0):
 
 def build_venv(dataset_list, tile_h, tile_w, seed=0):
     venv = DummyVecEnv([make_env(dataset_list, tile_h, tile_w, seed)])
-    venv = VecNormalize(venv, norm_obs=True, norm_reward=True, clip_obs=10.0)
+    venv = MaskPreservingVecNormalize(
+        venv, norm_obs=True, norm_reward=True, clip_obs=10.0
+    )
     return venv
 
 
@@ -224,7 +244,7 @@ def main():
         tensorboard_log=log_dir,
         verbose=1,
         seed=args.seed,
-        device=torch.device(args.device),
+        device=args.device,
     )
     print(f"Training on device: {model.device}")
 

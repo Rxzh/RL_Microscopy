@@ -115,7 +115,8 @@ class EBSDPolicy(ActorCriticPolicy):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         spatial = self.features_extractor.forward_spatial(obs)  # (B,32,H,W)
         logits = self._masked_logits(obs, spatial)              # (B, H*W)
-        values = self.value_net(self.features_extractor(obs))   # (B, 1)
+        pooled = self.features_extractor.pool_proj(spatial)     # (B, features_dim)
+        values = self.value_net(pooled)                         # (B, 1)
 
         dist = self.action_dist.proba_distribution(action_logits=logits)
         actions = dist.get_actions(deterministic=deterministic)
@@ -127,7 +128,8 @@ class EBSDPolicy(ActorCriticPolicy):
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         spatial = self.features_extractor.forward_spatial(obs)
         logits = self._masked_logits(obs, spatial)
-        values = self.value_net(self.features_extractor(obs))
+        pooled = self.features_extractor.pool_proj(spatial)
+        values = self.value_net(pooled)
 
         dist = self.action_dist.proba_distribution(action_logits=logits)
         log_prob = dist.log_prob(actions)

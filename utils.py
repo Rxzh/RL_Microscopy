@@ -31,14 +31,13 @@ def load_latent_map(tif_dir: str) -> np.ndarray:
 def compute_true_gradients(latent_map: np.ndarray) -> np.ndarray:
     """Compute per-pixel gradient magnitude across all latent channels.
 
-    For each channel c, compute sqrt(gx²+gy²) then take the L2 norm
-    across channels, yielding a scalar map of shape (H, W).
+    Vectorized: computes gradients for all N channels simultaneously,
+    yielding a scalar map of shape (H, W).
     """
-    H, W, N = latent_map.shape
-    grad_mag = np.zeros((H, W, N), dtype=np.float32)
-    for c in range(N):
-        gy, gx = np.gradient(latent_map[:, :, c])
-        grad_mag[:, :, c] = np.sqrt(gx ** 2 + gy ** 2)
+    # np.gradient on axis=0/1 operates on all channels at once: (H, W, N)
+    gy = np.gradient(latent_map, axis=0)  # (H, W, N)
+    gx = np.gradient(latent_map, axis=1)  # (H, W, N)
+    grad_mag = np.sqrt(gx ** 2 + gy ** 2)  # (H, W, N) per-channel magnitude
     return np.linalg.norm(grad_mag, axis=-1)  # (H, W)
 
 

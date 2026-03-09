@@ -4,11 +4,7 @@ import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 
-from utils import (
-    interpolate_latents,
-    compute_gradient_map,
-    compute_uncertainty_map,
-)
+from utils import compute_gradient_map
 
 
 class EBSDEnv(gym.Env):
@@ -79,13 +75,17 @@ class EBSDEnv(gym.Env):
         self.tile_origin: tuple = (0, 0)
         self._dataset_idx: int = 0
         self._mask: np.ndarray = None
-        self._sampled_coords: list = None
-        self._sampled_values: list = None
         self._interp_latents: np.ndarray = None
+        self._nearest_dist: np.ndarray = None   # squared distance to nearest sample
         self._grad_map: np.ndarray = None
         self._uncertainty_map: np.ndarray = None
         self.step_count: int = 0
         self._last_episode_snapshot: dict = None
+
+        # Precompute pixel coordinate grids for incremental NN updates
+        rows_g = np.arange(self.H, dtype=np.float32)
+        cols_g = np.arange(self.W, dtype=np.float32)
+        self._grid_cols, self._grid_rows = np.meshgrid(cols_g, rows_g)
 
     # ------------------------------------------------------------------
     # Gymnasium API
@@ -108,8 +108,8 @@ class EBSDEnv(gym.Env):
         self.true_grad_map = full_grad[r0:r0 + self.tile_h, c0:c0 + self.tile_w].astype(np.float32)
 
         self._mask = np.zeros((self.H, self.W), dtype=np.float32)
-        self._sampled_coords = []
-        self._sampled_values = []
+        self._nearest_dist = np.full((self.H, self.W), np.inf, dtype=np.float32)
+        self._interp_latents = np.zeros((self.H, self.W, self.N), dtype=np.float32)
         self.step_count = 0
 
         # Seed a uniform grid of initial observations
@@ -119,7 +119,11 @@ class EBSDEnv(gym.Env):
             for c in cols:
                 self._add_sample(r, c)
 
-        self._rebuild_state()
+        # Compute gradient map from the initial interpolation
+        self._grad_map = compute_gradient_map(self._interp_latents)
+        # Uncertainty = normalized nearest distance
+        self._update_uncertainty()
+
         info = {"tile_origin": self.tile_origin, "dataset_idx": self._dataset_idx}
         return self._get_obs(), info
 
@@ -129,9 +133,11 @@ class EBSDEnv(gym.Env):
         # Predicted gradient at this location before sampling
         predicted_grad = float(self._grad_map[row, col])
 
-        # Add new sample
+        # Add new sample (incrementally updates interp_latents & nearest_dist)
         self._add_sample(row, col)
-        self._rebuild_state()
+        # Recompute gradient & uncertainty from updated interpolation
+        self._grad_map = compute_gradient_map(self._interp_latents)
+        self._update_uncertainty()
 
         true_grad = float(self.true_grad_map[row, col])
         reward = float(self.lam * (true_grad - predicted_grad) - self.beta)
@@ -169,16 +175,26 @@ class EBSDEnv(gym.Env):
     # ------------------------------------------------------------------
 
     def _add_sample(self, row: int, col: int):
+        """Add a sample and incrementally update nearest-neighbor interpolation."""
         self._mask[row, col] = 1.0
-        self._sampled_coords.append((row, col))
-        self._sampled_values.append(self.latent_map[row, col])
+        value = self.latent_map[row, col]  # (N,)
 
-    def _rebuild_state(self):
-        coords = np.array(self._sampled_coords, dtype=np.float32)   # (K, 2)
-        values = np.array(self._sampled_values, dtype=np.float32)   # (K, N)
-        self._interp_latents = interpolate_latents(coords, values, (self.H, self.W))
-        self._grad_map = compute_gradient_map(self._interp_latents)
-        self._uncertainty_map = compute_uncertainty_map(coords, (self.H, self.W))
+        # Squared Euclidean distance from every pixel to this new sample
+        d2 = (self._grid_rows - row) ** 2 + (self._grid_cols - col) ** 2  # (H, W)
+
+        # Update pixels that are closer to this new sample
+        closer = d2 < self._nearest_dist
+        self._nearest_dist[closer] = d2[closer]
+        self._interp_latents[closer] = value  # broadcast (N,) to all closer pixels
+
+    def _update_uncertainty(self):
+        """Recompute normalised uncertainty map from nearest distances."""
+        dist = np.sqrt(self._nearest_dist)
+        max_dist = dist.max()
+        if max_dist > 0:
+            self._uncertainty_map = dist / max_dist
+        else:
+            self._uncertainty_map = np.zeros_like(dist)
 
     def _get_obs(self) -> np.ndarray:
         # Build (H, W, N+3) then transpose to (N+3, H, W) for SB3
