@@ -6,6 +6,7 @@ import os
 import numpy as np
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.callbacks import (
     BaseCallback,
     CheckpointCallback,
@@ -39,6 +40,7 @@ class MaskPreservingVecNormalize(VecNormalize):
 def make_env(dataset_list, tile_h, tile_w, seed=0):
     def _init():
         env = EBSDEnv(dataset_list, tile_h=tile_h, tile_w=tile_w)
+        env = Monitor(env)
         env.reset(seed=seed)
         return env
     return _init
@@ -58,21 +60,20 @@ class EpisodeLogCallback(BaseCallback):
         self.figure_every = figure_every
         self.figure_dir = figure_dir
         self._episode_count = 0
-        self._current_ep_reward = 0.0
 
     def _on_step(self) -> bool:
-        rewards = self.locals["rewards"]   # shape (n_envs,)
-        dones   = self.locals["dones"]     # shape (n_envs,)
-        infos   = self.locals["infos"]
+        dones = self.locals["dones"]     # shape (n_envs,)
+        infos = self.locals["infos"]
 
         for i in range(len(dones)):
-            self._current_ep_reward += float(rewards[i])
             if dones[i]:
                 info = infos[i]
-                ep_len    = info.get("step_count", -1)
+                # Raw episode stats from Monitor wrapper
+                ep_info = info.get("episode")
+                ep_reward = ep_info["r"] if ep_info else 0.0
+                ep_len    = info.get("step_count", int(ep_info["l"]) if ep_info else -1)
                 tile_orig = info.get("tile_origin", (-1, -1))
                 ds_idx    = info.get("dataset_idx", 0)
-                ep_reward = self._current_ep_reward
 
                 print(
                     f"[Episode {self._episode_count + 1:>5d}] "
@@ -87,7 +88,6 @@ class EpisodeLogCallback(BaseCallback):
                 self.logger.dump(self.num_timesteps)
 
                 self._episode_count += 1
-                self._current_ep_reward = 0.0
 
                 if (self.figure_every > 0
                         and self._episode_count % self.figure_every == 0):
@@ -241,6 +241,7 @@ def main():
         ent_coef=0.01,
         vf_coef=0.5,
         max_grad_norm=0.5,
+        target_kl=0.02,
         tensorboard_log=log_dir,
         verbose=1,
         seed=args.seed,

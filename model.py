@@ -33,8 +33,8 @@ class EBSDFeaturesExtractor(BaseFeaturesExtractor):
             nn.ReLU(),
             nn.Conv2d(128, 64, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),  # H, W
-            nn.Conv2d(64, 32, kernel_size=1),  # (batch, 32, H, W)
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),  # ~H, ~W
+            nn.Conv2d(64, 32, kernel_size=1),  # (batch, 32, H', W')
         )
         self.pool_proj = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),  # (batch, 32, 1, 1)
@@ -49,7 +49,12 @@ class EBSDFeaturesExtractor(BaseFeaturesExtractor):
 
     def forward_spatial(self, observations: torch.Tensor) -> torch.Tensor:
         """Returns spatial feature map (batch, 32, H, W) for the actor."""
-        return self.encoder(observations)
+        H, W = observations.shape[2], observations.shape[3]
+        out = self.encoder(observations)
+        # Ensure output matches input spatial dims (stride-2 + upsample may differ for odd sizes)
+        if out.shape[2] != H or out.shape[3] != W:
+            out = out[:, :, :H, :W]
+        return out
 
 
 class EBSDPolicy(ActorCriticPolicy):
